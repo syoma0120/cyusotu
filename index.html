@@ -12,6 +12,7 @@
 <link rel="manifest" href="manifest.webmanifest">
 <link rel="apple-touch-icon" href="icon-180.png">
 <link rel="icon" href="icon-192.png">
+<script src="firebase-config.js"></script>
 <style>
 :root{
   --bg:#f5f4f0;--card:#fff;--ink:#1d1d1f;--sub:#6e6e73;--line:#e6e4de;
@@ -114,12 +115,14 @@ nav button.on .n{filter:none;opacity:1}
 .toast{position:fixed;left:50%;bottom:calc(88px + env(safe-area-inset-bottom));transform:translateX(-50%);background:var(--ink);color:#fff;padding:9px 16px;border-radius:999px;font-size:13px;opacity:0;transition:opacity .2s;pointer-events:none;z-index:30;max-width:90vw;text-align:center}
 .toast.show{opacity:1}
 .hidden{display:none!important}
+.code{font-size:24px;font-weight:700;letter-spacing:.08em;text-align:center;background:var(--bg);border-radius:12px;padding:14px;margin:4px 0 12px;font-variant-numeric:tabular-nums;user-select:all;-webkit-user-select:all}
+.btn.line{background:#06c755}
 </style>
 </head>
 <body>
 <div class="app">
   <header>
-    <h1>収支ノート</h1>
+    <div><h1>収支ノート</h1><div id="syncLbl" class="label" style="margin-top:2px"></div></div>
     <div class="month" id="monthBox">
       <button id="prevM" aria-label="前の月">‹</button>
       <span id="monthLbl"></span>
@@ -198,8 +201,12 @@ nav button.on .n{filter:none;opacity:1}
       <button class="btn" id="saveKey">保存</button>
       <p class="note">キーはこのiPhoneの中にだけ保存され、読み取りのときに Anthropic へ直接送られます。バックアップファイルには含まれません。キーは console.anthropic.com で発行できます。</p>
     </div>
+    <div class="card" id="cloudCard">
+      <h2>共有帳簿（自動で同期）</h2>
+      <div id="cloudBody"></div>
+    </div>
     <div class="card">
-      <h2>共有・バックアップ</h2>
+      <h2>ファイルで共有・バックアップ</h2>
       <div class="field"><label>あなたの名前（共有したとき誰の記録か表示）</label><input id="myName" type="text" placeholder="例：しょうま"></div>
       <label class="check"><input type="checkbox" id="withImg">レシート画像も含める（ファイルが大きくなります）</label>
       <button class="btn" id="exportJson">📤 帳簿ファイルを送る・保存</button>
@@ -269,18 +276,101 @@ const DB={
   getImg(id){return this.req("images","readonly",s=>s.get(id))},
   delImg(id){return this.req("images","readwrite",s=>s.delete(id))}
 };
-async function load(){S.entries=(await DB.all())||[];render()}
+/* ---------- 共有帳簿（Firebase） ---------- */
+const FB="https://www.gstatic.com/firebasejs/10.12.2/";
+const Cloud={on:false,db:null,f:null,code:null,unsub:null,status:"",justJoined:false,err:""};
+const hasConfig=()=>!!(window.FIREBASE_CONFIG&&window.FIREBASE_CONFIG.apiKey);
+const clean=o=>JSON.parse(JSON.stringify(o));
+const ccol=n=>Cloud.f.collection(Cloud.db,"ledgers",Cloud.code,n);
+function cloudErr(err){console.warn(err);toast("共有帳簿に保存できませんでした"+(err&&err.code==="permission-denied"?"（Firebaseのルールを確認）":""))}
+async function cloudInit(){
+  if(!hasConfig())return false;
+  if(Cloud.db)return true;
+  const [appM,authM,fsM]=await Promise.all([import(FB+"firebase-app.js"),import(FB+"firebase-auth.js"),import(FB+"firebase-firestore.js")]);
+  const app=appM.initializeApp(window.FIREBASE_CONFIG);
+  const auth=authM.getAuth(app);
+  if(auth.authStateReady)await auth.authStateReady();
+  if(!auth.currentUser)await authM.signInAnonymously(auth);
+  let db;try{db=fsM.initializeFirestore(app,{localCache:fsM.persistentLocalCache()})}catch(e){db=fsM.getFirestore(app)}
+  Cloud.db=db;Cloud.f=fsM;return true;
+}
+function cloudSubscribe(){
+  if(Cloud.unsub)Cloud.unsub();
+  Cloud.status="connecting";renderSync();
+  Cloud.unsub=Cloud.f.onSnapshot(ccol("entries"),{includeMetadataChanges:true},snap=>{
+    S.entries=snap.docs.map(d=>d.data()).filter(e=>e&&e.id&&e.amount!=null);
+    Cloud.status=snap.metadata.fromCache?"offline":"synced";
+    if(Cloud.justJoined&&!snap.metadata.fromCache){Cloud.justJoined=false;toast(snap.size?`共有帳簿に参加しました（${snap.size}件）`:"まだ記録がない帳簿です。合言葉が合っているか確認してください")}
+    render();renderSync();
+  },err=>{Cloud.status="error";Cloud.err=err.code||"";renderSync();renderCloud()});
+}
+async function fitForCloud(b){let x=await shrink(b,1000,.6);if(x.size>700000)x=await shrink(b,700,.5);return x}
+async function putRaw(e){if(Cloud.on){Cloud.f.setDoc(Cloud.f.doc(ccol("entries"),e.id),clean(e)).catch(cloudErr)}else await DB.put(e)}
+async function putImgRaw(id,blob){
+  if(Cloud.on){const small=await fitForCloud(blob);const data="data:image/jpeg;base64,"+await blobToB64(small);Cloud.f.setDoc(Cloud.f.doc(ccol("images"),id),{data}).catch(cloudErr)}
+  else await DB.putImg(id,blob)}
+async function getImgRaw(id){
+  if(Cloud.on){const snap=await Cloud.f.getDoc(Cloud.f.doc(ccol("images"),id));const d=snap.exists()&&snap.data().data;return d?await (await fetch(d)).blob():null}
+  return DB.getImg(id)}
+async function delRaw(id){
+  if(Cloud.on){Cloud.f.deleteDoc(Cloud.f.doc(ccol("entries"),id)).catch(cloudErr);Cloud.f.deleteDoc(Cloud.f.doc(ccol("images"),id)).catch(()=>{})}
+  else{await DB.del(id);await DB.delImg(id)}}
+function genCode(){const c="ABCDEFGHJKMNPQRSTUVWXYZ23456789";const a=crypto.getRandomValues(new Uint8Array(12));let s="";a.forEach((v,i)=>{s+=c[v%c.length];if(i%4===3&&i<11)s+="-"});return s}
+function normCode(t){const x=String(t||"").toUpperCase().replace(/[^A-Z0-9]/g,"");return x.length===12?x.match(/.{4}/g).join("-"):null}
+async function joinLedger(code,copyLocal){
+  try{if(!await cloudInit()){toast("共有の準備（Firebase設定）がまだです");return}}
+  catch(e){toast("共有帳簿に接続できません。ネット接続を確認してください");return}
+  const local=copyLocal?((await DB.all())||[]):[];
+  Cloud.code=code;Cloud.on=true;Cloud.justJoined=true;LS.set("ledgerCode",code);
+  for(const e of local){await putRaw(e);if(e.hasImg){try{const b=await DB.getImg(e.id);if(b)await putImgRaw(e.id,b)}catch(err){}}}
+  cloudSubscribe();renderCloud();
+}
+async function leaveLedger(){
+  for(const e of S.entries){try{await DB.put(e)}catch(err){}}
+  if(Cloud.unsub)Cloud.unsub();Cloud.unsub=null;Cloud.on=false;Cloud.code=null;Cloud.status="";
+  try{localStorage.removeItem("ledgerCode")}catch(e){}
+  await load();renderSync();renderCloud();toast("共有をやめました（記録はこの端末に残しました）");
+}
+function shareText(){return `収支ノートの共有帳簿に参加してね！\n① ${location.origin+location.pathname} をSafariで開いて「ホーム画面に追加」\n② 設定 → 共有帳簿 → 合言葉「${Cloud.code}」で参加`}
+function renderSync(){
+  const l=$("#syncLbl");if(!l)return;
+  if(!Cloud.on){l.textContent="📱 この端末のみ";l.style.color="";return}
+  const m={connecting:["接続中…",""],synced:["☁️ 共有中・同期済み","var(--accent)"],offline:["📴 オフライン（つながると同期）","#a06a00"],error:["⚠️ 共有帳簿に接続できません","var(--out)"]}[Cloud.status]||["☁️ 共有中",""];
+  l.textContent=m[0];l.style.color=m[1];
+}
+function renderCloud(){
+  const b=$("#cloudBody");if(!b)return;
+  if(!hasConfig()){b.innerHTML=`<p class="note" style="margin-top:0">まだ準備中です（Firebaseの設定が入ると使えるようになります）。</p>`;return}
+  if(Cloud.on){
+    b.innerHTML=`<span class="flabel">この帳簿の合言葉</span><div class="code">${esc(Cloud.code)}</div>
+      ${Cloud.status==="error"?`<p class="err">接続できません（${esc(Cloud.err)}）。Firebaseのルールを確認してください。</p>`:""}
+      <a class="btn line" id="c_line" href="https://line.me/R/share?text=${encodeURIComponent(shareText())}" target="_blank" rel="noopener">LINEで合言葉を送る</a><div style="height:8px"></div>
+      <div class="row2"><button class="btn ghost" id="c_copy">合言葉をコピー</button><button class="btn danger" id="c_leave">共有をやめる</button></div>
+      <p class="note">この合言葉を知っている人だけが、同じ帳簿を見て記録できます。知らない人には教えないでください。</p>`;
+    $("#c_copy").onclick=async()=>{try{await navigator.clipboard.writeText(shareText());toast("コピーしました")}catch(e){toast("合言葉："+Cloud.code)}};
+    $("#c_leave").onclick=()=>{const x=$("#c_leave");if(x.dataset.c)leaveLedger();else{x.dataset.c=1;x.textContent="もう一度押してやめる"}};
+    return;
+  }
+  b.innerHTML=`<p class="note" style="margin-top:0">共有帳簿を作るか、友だちから届いた合言葉で参加すると、2人の記録が自動で同じになります。先に下の「あなたの名前」を入れておくと、誰の記録かわかります。</p>
+    <label class="check"><input type="checkbox" id="c_copyLocal" checked>この端末の今までの記録も共有帳簿に入れる</label>
+    <button class="btn" id="c_new">新しく共有帳簿を作る</button>
+    <div class="field" style="margin:14px 0 8px"><label>友だちから届いた合言葉</label><input id="c_code" type="text" autocapitalize="characters" autocomplete="off" placeholder="XXXX-XXXX-XXXX"></div>
+    <button class="btn ghost" id="c_join">合言葉で参加する</button>`;
+  $("#c_new").onclick=()=>joinLedger(genCode(),$("#c_copyLocal").checked);
+  $("#c_join").onclick=()=>{const c=normCode($("#c_code").value);if(!c){toast("合言葉は英数字12文字です");return}joinLedger(c,$("#c_copyLocal").checked)};
+}
+async function load(){if(Cloud.on)return;S.entries=(await DB.all())||[];render()}
 async function saveEntry(e,img){
   if(!e.id)e.id="e"+Date.now().toString(36)+Math.random().toString(36).slice(2,6);
   if(e._custom&&!(e._customText||"").trim()){toast("勘定科目を入力してください");return false}
   delete e._custom;delete e._customText;e.updatedAt=Date.now();if(!e.by){const n=LS.get("myName").trim();if(n)e.by=n}
-  try{await DB.put(e);if(img){await DB.putImg(e.id,img);e.hasImg=true;await DB.put(e)}}
+  try{if(img)e.hasImg=true;await putRaw(e);if(img)await putImgRaw(e.id,img)}
   catch(err){toast("保存できませんでした");return false}
   const i=S.entries.findIndex(x=>x.id===e.id);if(i>=0)S.entries[i]=e;else S.entries.push(e);
   render();toast("保存しました");return true;
 }
 async function deleteEntry(id){
-  try{await DB.del(id);await DB.delImg(id)}catch(e){toast("削除できませんでした");return}
+  try{await delRaw(id)}catch(e){toast("削除できませんでした");return}
   S.entries=S.entries.filter(x=>x.id!==id);render();toast("削除しました");
 }
 
@@ -395,7 +485,7 @@ let sheetUrl=null;
 async function openEdit(id){
   const src=S.entries.find(x=>x.id===id);if(!src)return;
   const e=JSON.parse(JSON.stringify(src));const sh=$("#sheet");
-  let img=null;if(e.hasImg){try{img=await DB.getImg(e.id)}catch(err){}}
+  let img=null;if(e.hasImg){try{img=await getImgRaw(e.id)}catch(err){}}
   if(sheetUrl)URL.revokeObjectURL(sheetUrl);sheetUrl=img?URL.createObjectURL(img):null;
   const draw=()=>{
     sh.innerHTML=`<h3>記録を編集</h3>`+(e.by?`<p class="note" style="margin:-8px 0 12px">記録した人：${esc(e.by)}</p>`:"")+
@@ -502,7 +592,7 @@ async function shareOrSave(blob,name){
 }
 $("#exportJson").onclick=async()=>{
   const withImg=$("#withImg").checked;const images={};
-  if(withImg){for(const e of S.entries){if(e.hasImg){try{const b=await DB.getImg(e.id);if(b)images[e.id]="data:image/jpeg;base64,"+await blobToB64(b)}catch(err){}}}}
+  if(withImg){for(const e of S.entries){if(e.hasImg){try{const b=await getImgRaw(e.id);if(b)images[e.id]="data:image/jpeg;base64,"+await blobToB64(b)}catch(err){}}}}
   const data={app:"shushi-note",version:1,exportedAt:new Date().toISOString(),from:LS.get("myName"),entries:S.entries,images:withImg?images:undefined};
   const name=`収支ノート_${LS.get("myName")||"帳簿"}_${today()}.json`;
   await shareOrSave(new Blob([JSON.stringify(data)],{type:"application/json"}),name);
@@ -519,8 +609,8 @@ $("#importFile").onchange=async ev=>{
       if(cur&&(cur.updatedAt||0)>=(e.updatedAt||0))continue;
       const img=data.images&&data.images[e.id];
       const rec={...e,hasImg:!!(img||(cur&&cur.hasImg))};
-      await DB.put(rec);
-      if(img){const b=await (await fetch(img)).blob();await DB.putImg(e.id,b)}
+      await putRaw(rec);
+      if(img){const b=await (await fetch(img)).blob();await putImgRaw(e.id,b)}
       cur?upd++:add++;
     }
     await load();toast(`読み込みました（追加 ${add}件・更新 ${upd}件）`);
@@ -547,7 +637,7 @@ function go(v){
   S.view=v;
   ["home","cal","add","receipt","set"].forEach(x=>$("#v-"+x).classList.toggle("hidden",x!==v));
   document.querySelectorAll("nav button").forEach(b=>b.classList.toggle("on",b.dataset.v===v));
-  if(v==="add")renderAdd();if(v==="receipt")updateAvail();if(v==="set")initSettings();
+  if(v==="add")renderAdd();if(v==="receipt")updateAvail();if(v==="set"){initSettings();renderCloud()}
   render();window.scrollTo(0,0);
 }
 document.querySelectorAll("nav button").forEach(b=>b.onclick=()=>go(b.dataset.v));
@@ -563,7 +653,13 @@ document.addEventListener("click",ev=>{
 (async()=>{
   const standalone=window.matchMedia("(display-mode: standalone)").matches||navigator.standalone;
   if(!standalone&&/iPhone|iPad|iPod/.test(navigator.userAgent))$("#installTip").classList.remove("hidden");
-  try{await DB.open();await load()}catch(e){$("#recent").innerHTML=`<div class="empty">データを開けませんでした。プライベートブラウズを解除してください。</div>`}
+  try{await DB.open()}catch(e){$("#recent").innerHTML=`<div class="empty">データを開けませんでした。プライベートブラウズを解除してください。</div>`}
+  const code=LS.get("ledgerCode");
+  if(code&&hasConfig()){
+    try{await cloudInit();Cloud.code=code;Cloud.on=true;cloudSubscribe()}
+    catch(e){toast("共有帳簿に接続できません。この端末の記録を表示しています");try{await load()}catch(err){}}
+  }else{try{await load()}catch(err){}}
+  renderSync();
   try{
     if(navigator.storage&&navigator.storage.persist){const ok=await navigator.storage.persisted()||await navigator.storage.persist();$("#persistPill").textContent=ok?"保護中":"標準";$("#persistPill").classList.toggle("ok",ok)}
     else $("#persistPill").textContent="標準";
